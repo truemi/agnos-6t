@@ -14,11 +14,14 @@ name: build-kernel-size
 #   5) fullopt（相机/音频/GPU/WLAN 全留，image_size 50.40 MiB）→ 能被装载，
 #      但设备离线、USB 完全不枚举、屏幕停在 ABL 警告页 ⇒ 内核早期挂住
 #   6) 换成真正的 AGNOS system.img（1.7 GiB）后现象不变 ⇒ 与 rootfs 无关
+#   7) 把原版全功能内核（真实 55.19 MiB）的 image_size 字段改写为 52 MiB：
+#      不再被拒（设备保持离线、不回 fastboot）→ 说明「≤52 只解决装载，不解决启动」
+#      nocam 的真实值 49.38 MiB 同样能被装载并同样挂住，双证
 #
-# 所以现在只剩「内核在哪一步挂住」。本 workflow 用两个单变量变体二分：
-#   nodrm : fullopt - DRM（去掉整个显示子系统）
-#   nocam : fullopt - 相机子系统
-# 判据：AGNOS 用户态起来后，主机会出现 USB NCM 网卡（不需要屏幕、不需要 UART）。
+# 所以现在只剩「内核在哪一步挂住」。用单变量减法定位：
+#   nokgsl : fullopt - GPU(KGSL)     —— 怀疑固件路径不同导致 request_firmware 长等待
+#   nodrm2 : fullopt - 显示子系统     —— 上一版 nodrm 链接失败，这里补齐依赖符号
+# 判据：能启动时屏幕会直接出现内核日志；跑进用户态则主机出现 USB NCM 网卡。
 #
 # 注：image_size 必须 ≤ 52 MiB，报告步骤会打印该值。
 
@@ -49,7 +52,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [nodrm, nocam]
+        variant: [nokgsl, nodrm2]
 
     steps:
       - name: Checkout (this repo, 含 dts/defconfig)
@@ -145,25 +148,30 @@ jobs:
                 -d CGROUP_DEBUG -d SCSI_DEBUG \
                 -e CC_OPTIMIZE_FOR_SIZE -d CC_OPTIMIZE_FOR_PERFORMANCE || true
 
-          elif [ "${{ matrix.variant }}" = "nodrm" ]; then
-            echo "=== nodrm：在 fullopt 基础上【只去掉显示子系统】==="
-            # 目的：判定「内核挂住」是否发生在 DRM/SDE/DSI 面板初始化。
-            # 去掉显示后屏幕不会有输出，判据改为：AGNOS 用户态起来后
-            # USB NCM 网卡会出现在主机 ifconfig 里。
+          elif [ "${{ matrix.variant }}" = "nokgsl" ]; then
+            echo "=== nokgsl：fullopt 基础上【只去掉 GPU(KGSL)】==="
+            # 假设：KGSL 早 probe，若 6T 的 GPU 固件路径不同（cmdline 里是
+            # firmware_class.path=/firmware/image，原厂是 /vendor/firmware_mnt/image），
+            # request_firmware 可能长时间等待 → 表现为「早期挂住」。
+            # 保留显示 + 屏幕日志，若真能启动，屏幕上会直接看到输出。
             $SC -d KALLSYMS_ALL -d DEBUG_KERNEL -d SLUB_DEBUG -d PROFILING \
                 -d PSTORE_FTRACE -d MSM_RTB -d MSM_RTB_SEPARATE \
                 -d CGROUP_DEBUG -d SCSI_DEBUG || true
-            $SC -d DRM || true
+            $SC -d QCOM_KGSL -d QCOM_KGSL_IOMMU || true
             $SC -e CC_OPTIMIZE_FOR_SIZE -d CC_OPTIMIZE_FOR_PERFORMANCE || true
 
-          elif [ "${{ matrix.variant }}" = "nocam" ]; then
-            echo "=== nocam：在 fullopt 基础上【只去掉相机 subsystems】==="
-            # 目的：判定是否 camera_v2 在 6T 上 probe 时死等。
+          elif [ "${{ matrix.variant }}" = "nodrm2" ]; then
+            echo "=== nodrm2：fullopt 基础上【去掉显示子系统】==="
+            # 上一版 nodrm 链接失败，原因是 mdss-pll-util 和 synaptics 触摸仍引用
+            # msm_dss_*/msm_drm_*。这里把它们的 Kconfig 一起关掉：
+            #   QCOM_MDSS_PLL           -> mdss_pll_util_resource_* (msm_dss_*)
+            #   TOUCHSCREEN_SYNAPTICS_DSX -> msm_drm_register_client
+            #   MSM_SDE_ROTATOR / DRM_SDE_WB -> 其余 SDE 依赖
             $SC -d KALLSYMS_ALL -d DEBUG_KERNEL -d SLUB_DEBUG -d PROFILING \
                 -d PSTORE_FTRACE -d MSM_RTB -d MSM_RTB_SEPARATE \
                 -d CGROUP_DEBUG -d SCSI_DEBUG || true
-            $SC -d MSMB_CAMERA -d MSM_CAMERA_SENSOR -d MSM_ISPIF \
-                -d MSM_ISPIF_V2 -d MSMB_JPEG || true
+            $SC -d DRM -d QCOM_MDSS_PLL -d MSM_MDSS_PLL \
+                -d TOUCHSCREEN_SYNAPTICS_DSX -d MSM_SDE_ROTATOR -d DRM_SDE_WB || true
             $SC -e CC_OPTIMIZE_FOR_SIZE -d CC_OPTIMIZE_FOR_PERFORMANCE || true
           fi
 
