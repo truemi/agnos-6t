@@ -137,23 +137,23 @@ jobs:
 
           if [ "${{ matrix.variant }}" = "probe" ]; then
             echo "=== probe：激进瘦身，仅用于判定体积边界（不作交付）==="
-            $SC -d MSMB_CAMERA -d MSM_CAMERA_SENSOR \
+            # ★ 教训 2026-11-08：不要关 CONFIG_WLAN。它会让 WIRELESS_EXT 的结构体成员消失，
+            #   而 drivers/staging/qcacld-3.0 仍以 QCA_CLD_WLAN=y 参与编译，直接编译失败：
+            #     error: 'struct net_device' has no member named 'wireless_handlers'
+            #   要瘦无线，就精确关掉 QCA_CLD_WLAN 本身（它是体积大户）。
+            $SC -d QCA_CLD_WLAN \
+                -d MSMB_CAMERA -d MSM_CAMERA_SENSOR \
                 -d QCOM_KGSL -d QCOM_KGSL_IOMMU \
                 -d SND_SOC -d SOUND \
                 -d NFC_NQ \
-                -d WLAN -d CNSS_UTILS -d WCNSS_MEM_PRE_ALLOC \
-                -d BT -d BLUETOOTH \
-                -d KALLSYMS_ALL -d DEBUG_KERNEL -d SLUB_DEBUG -d DEBUG_FS \
-                -d PROFILING -d FTRACE -d FUNCTION_TRACER \
-                -d PSTORE_FTRACE \
+                -d KALLSYMS_ALL -d DEBUG_KERNEL -d SLUB_DEBUG \
+                -d PROFILING -d PSTORE_FTRACE \
                 -d DRM_SDE_EVTLOG_DEBUG -d MSM_SDE_ROTATOR_EVTLOG_DEBUG \
                 -d MSM_GLADIATOR_HANG_DETECT \
                 -d MSM_RTB -d MSM_RTB_SEPARATE \
                 -d CGROUP_DEBUG -d SCSI_DEBUG \
-                -d MMC_BLOCK_TEST -d MMC_TEST \
                 -d F2FS_FS -d NTFS_FS -d XFS_FS -d ISO9660_FS -d UDF_FS \
                 -d NFS_FS -d CIFS -d 9P_FS -d HFS_FS -d JFS_FS \
-                -d DRM_MSM_HDMI -d SND_USB -d SND_USB_AUDIO \
                 -e CC_OPTIMIZE_FOR_SIZE -d CC_OPTIMIZE_FOR_PERFORMANCE || true
           else
             echo "=== fullopt：功能全留，只做 -Os + 去调试 ==="
