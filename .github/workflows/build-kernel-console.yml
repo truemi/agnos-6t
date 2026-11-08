@@ -1,18 +1,30 @@
-name: build-kernel-min
+name: build-kernel-console
 
-# OnePlus 6T (fajita / SDM845) AGNOS 内核 —— 最小化重编，目标 Image < 34 MiB
+# OnePlus 6T (fajita / SDM845) AGNOS 内核 —— 「可见性」构建
 #
-# 背景：build-kernel.yml 产出的内核解压 43.52 MiB（image_size 55.19 MiB），
-#   6T 原厂 ABL 装不下（原厂内核 29.17 MiB / image_size 34.55 MiB），实机
-#   会离线 3~4.5 s 回 fastboot、slot-retry-count 恒 7（内核一行没执行）。
-#   TWRP（内核 ~15 MiB）能刷入并启动，反向印证「内核太大」是唯一卡点。
+# 目的：不改任何驱动（camera / audio / GPU 全部保留原样），只让内核的
+#       printk 能显示在 6T 屏幕上，从而看到启动到底死在哪一步。
 #
-# 本流程在能编出来的 fajita_defconfig 上做瘦身：
-#   关相机(MSMB_CAMERA)、音频(SND_SOC + WCD934X/WSA881X)、3D GPU(QCOM_KGSL)、
-#   NFC，并 -O2 → -Os、去掉 KALLSYMS_ALL。
-#   保留：UFS、USB DWC3 + gadget(NCM/ACM)、DRM/面板(s6e3fc2x01)、串口 geni、ext4。
+# 为什么之前的「内核太大」结论不可靠：
+#   * ABL 收到的是 gzip 内核，它不解压，看不到 Image 头里的 image_size；
+#   * 原厂 kernel+ramdisk = 27.47 MiB，本内核 16.03 MiB，按总量比本内核更小；
+#   * 每次测试前都执行了 `fastboot set_active a`，该命令会把
+#     slot-retry-count 重置为 7，所以「计数恒为 7」不能证明 ABL 没启动内核。
+#   真正缺的是日志：`CONFIG_FRAMEBUFFER_CONSOLE` 未开，又没有 UART。
 #
-# 产物只有内核 Image.gz-dtb + 尺寸报告，打包 boot / 刷机在本地脚本包做。
+# 本构建只做三处配置改动（体积代价约 150–250 KiB）：
+#   + CONFIG_FRAMEBUFFER_CONSOLE=y          内核日志画到 DRM fbdev 上
+#   + CONFIG_FRAMEBUFFER_CONSOLE_DETECT_PRIMARY=y
+#   + CONFIG_PANIC_TIMEOUT=0                panic 后不重启，把最后信息留在屏幕
+#   另外关掉 MODULE_SIG（与官方一致，仅影响模块签名，不影响功能）。
+#
+# 依赖已确认齐全（来自已编译内核的 IKCONFIG）：
+#   CONFIG_VT=y / CONFIG_VT_CONSOLE=y / CONFIG_FB=y / CONFIG_DRM_FBDEV_EMULATION=y
+#   CONFIG_BACKLIGHT_CLASS_DEVICE=y，且 6T 面板用 bl_ctrl_dcs（DSI 控亮度），
+#   不依赖独立 WLED 背光芯片。
+#
+# 产物：Image.gz-dtb + dtb + kernel.config + 构建后配置核对，
+#       打包 boot.img / 刷机仍在本地 op6t-agnos 脚本包完成。
 
 on:
   workflow_dispatch:
@@ -25,10 +37,6 @@ on:
         description: 'make -j'
         required: false
         default: '4'
-      max_image_mib:
-        description: 'Image 解压尺寸上限(MiB)，超过判 FAIL'
-        required: false
-        default: '34'
 
 permissions:
   contents: read
@@ -55,7 +63,7 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends \
             build-essential bc bison flex libssl-dev libelf-dev \
             gcc-aarch64-linux-gnu device-tree-compiler \
-            python3 python3-pip cpio rsync xz-utils libssl-dev libelf-dev \
+            python3 python3-pip cpio rsync xz-utils \
             gcc libc6-dev make
           # Linux 4.9 的 scripts/ 硬引用 python2（ubuntu-24.04 已移除），软链到 python3
           sudo ln -sf /usr/bin/python3 /usr/local/bin/python2
@@ -103,7 +111,26 @@ jobs:
           PYEOF
           python3 -m py_compile scripts/gcc-wrapper.py && echo "gcc-wrapper.py OK"
 
-      - name: Configure (base defconfig)
+      - name: Patch camera_v2 CPP clk header
+        run: |
+          set -euo pipefail
+          cd kernel
+          # camera_v2 的 CPP 依赖高通私有 <linux/clk/msm-clk.h>，AGNOS 树里没有。
+          # 相机是 openpilot camerad 的命门，必须保留，所以这个 shim 必须打。
+          if [ -f drivers/media/platform/msm/camera_v2/pproc/cpp/msm_cpp_soc.c ]; then
+            mkdir -p include/linux/clk
+            cat > include/linux/clk/msm-clk.h <<'EOF'
+          #ifndef _LINUX_CLK_MSM_CLK_H
+          #define _LINUX_CLK_MSM_CLK_H
+          #include <linux/clk.h>
+          #include <linux/clk-provider.h>
+          #endif
+          EOF
+            printf '#include <linux/clk-provider.h>\n' > include/linux/clk/msm-clk-provider.h
+            echo "created clk shim headers"
+          fi
+
+      - name: Configure (base defconfig, 功能不减)
         run: |
           set -euo pipefail
           cd kernel
@@ -111,30 +138,30 @@ jobs:
           mkdir -p out
           make O=out "$DEFCONFIG" 2>&1 | tail -15
 
-      - name: Debloat (shrink kernel < 34 MiB)
+      - name: Enable on-screen console (only visibility change)
         run: |
           set -euo pipefail
           cd kernel
           export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
           SC="scripts/config --file out/.config"
-          # 关掉体积大头（都是内置 =y）：
-          #   相机 camera_v2、音频 ASoC 编解码、3D GPU、NFC、全量符号表
-          $SC -d MSMB_CAMERA \
-              -d MSM_CAMERA_SENSOR \
-              -d SND_SOC \
-              -d SND_SOC_WCD934X \
-              -d SND_SOC_WSA881X \
-              -d QCOM_KGSL \
-              -d NFC_NQ \
-              -d KALLSYMS_ALL \
-              -d CC_OPTIMIZE_FOR_PERFORMANCE \
-              -e CC_OPTIMIZE_FOR_SIZE || true
-          # 不签模块（与官方一致）
+          # 只开可见性，不动 camera / audio / GPU
+          $SC -e FRAMEBUFFER_CONSOLE \
+              -e FRAMEBUFFER_CONSOLE_DETECT_PRIMARY \
+              -e FRAMEBUFFER_CONSOLE_ROTATION || true
+          # VT 相关若被依赖隐藏，一并打开
+          $SC -e VT -e VT_CONSOLE -e FB -e DRM_FBDEV_EMULATION || true
+          # panic 后不自动重启，把最后的信息留在屏幕上（排查用；正常启动不受影响）
+          $SC --set-val PANIC_TIMEOUT 0 || true
+          # 不签模块（与官方 build_kernel.sh 一致）
           $SC -d MODULE_SIG -d MODULE_SIG_ALL -d MODULE_SIG_FORCE \
               -d SYSTEM_TRUSTED_KEYS -d SYSTEM_REVOCATION_KEYS || true
           make O=out olddefconfig
-          echo "=== 瘦身后关键配置（应全部 not set，除 CC_OPTIMIZE_FOR_SIZE=y）==="
-          grep -E "^CONFIG_MSMB_CAMERA=|^CONFIG_MSM_CAMERA_SENSOR=|^CONFIG_SND_SOC=|^CONFIG_QCOM_KGSL=|^CONFIG_NFC_NQ=|^CONFIG_CC_OPTIMIZE_FOR_SIZE=|^CONFIG_KALLSYMS_ALL=" out/.config || true
+          echo "=== 可见性配置核对（应为 y）==="
+          grep -E "^CONFIG_(FRAMEBUFFER_CONSOLE|FRAMEBUFFER_CONSOLE_DETECT_PRIMARY|VT|VT_CONSOLE|FB|DRM_FBDEV_EMULATION)=" out/.config || true
+          echo "=== panic 超时（应为 0）==="
+          grep -E "^CONFIG_PANIC_TIMEOUT=" out/.config || true
+          echo "=== 功能配置核对（必须保持开启）==="
+          grep -E "^CONFIG_(MSMB_CAMERA|MSM_CAMERA_SENSOR|SND_SOC|SND_SOC_WCD934X|SND_SOC_WSA881X|QCOM_KGSL)=" out/.config || true
 
       - name: Build dtb first (fail fast)
         run: |
@@ -165,29 +192,20 @@ jobs:
         run: |
           set -uo pipefail
           K=kernel/out/arch/arm64/boot
-          MAX=${{ inputs.max_image_mib || '34' }}
           mkdir -p dist
           report() {
             local f="$1"; [ -f "$f" ] || return 0
-            printf '%-12s %10s bytes  (%6.2f MiB)\n' \
+            printf '%-14s %10s bytes  (%6.2f MiB)\n' \
               "$(basename "$f")" "$(stat -c%s "$f")" \
               "$(echo "scale=4; $(stat -c%s "$f") / 1048576" | bc)"
           }
-          echo "=== 内核尺寸报告（目标 Image <= ${MAX} MiB，对齐原厂 34.55 MiB）==="
+          echo "=== 内核尺寸（仅供对照，不是判据）"
+          echo "    原厂: 压缩 12.33 MiB / image_size 34.55 MiB"
+          echo "    TWRP: 压缩 13.37 MiB / image_size 37.13 MiB"
           report "$K/Image"
           report "$K/Image.gz"
           report "$K/Image.gz-dtb"
-          report "$K/vmlinux"
-          N=$(stat -c%s "$K/Image" 2>/dev/null || echo 0)
-          IMG_MIB=$(echo "scale=2; $N / 1048576" | bc)
-          if [ -f "$K/Image" ] && [ "$(echo "$IMG_MIB <= $MAX" | bc)" = 1 ]; then
-            echo "SIZE_PASS: Image=${IMG_MIB} MiB <= ${MAX} MiB"
-          else
-            echo "SIZE_FAIL: Image=${IMG_MIB} MiB > ${MAX} MiB（仍需继续瘦身）"
-          fi
-          echo "$IMG_MIB" > dist/image_mib.txt
-          VERDICT="FAIL"; [ "$(echo "$IMG_MIB <= $MAX" | bc)" = 1 ] && VERDICT="PASS"
-          echo "$VERDICT" > dist/size_verdict.txt
+          cp "$K/Image.gz" dist/ 2>/dev/null || true
 
       - name: Collect artifacts
         if: always()
@@ -199,13 +217,20 @@ jobs:
           done
           [ -f "$K/dts/qcom/${DT_NAME}.dtb" ] && cp "$K/dts/qcom/${DT_NAME}.dtb" dist/
           cp kernel/out/.config dist/kernel.config 2>/dev/null || true
+          # 相机/音频/GPU 关键符号必须在，确认没有被裁掉
+          if [ -f kernel/out/vmlinux ]; then
+            aarch64-linux-gnu-nm kernel/out/vmlinux 2>/dev/null \
+              | grep -iE "msm_camera|imx519|imx376|imx371|wcd934x|wsa881|kgsl|mdss|dsi_display" \
+              > dist/kernel-symbols.txt || true
+            echo "关键符号行数: $(wc -l < dist/kernel-symbols.txt)"
+          fi
           ls -lh dist/
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: 6T-kernel-min-${{ inputs.kernel_ref || 'master' }}
+          name: 6T-kernel-console-${{ inputs.kernel_ref || 'master' }}
           path: dist
           if-no-files-found: warn
           retention-days: 14
