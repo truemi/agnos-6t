@@ -1,27 +1,26 @@
 name: build-kernel-size
 
-# OnePlus 6T (fajita / SDM845) —— 内核体积边界判定实验
+# OnePlus 6T (fajita / SDM845) —— 「内核早期挂住」单变量二分
 #
-# 已验证的事实（2026-11-08 实机）：
-#   * 原厂内核 + 原厂 ramdisk，用本仓库外部工具 mkbootimg.py 重打包 → 安卓正常启动
-#     ⇒ 打包链 / header v1 / 地址 / os_version / vbmeta 全部没问题
-#   * 原厂内核 + AGNOS 的 sdm845-oneplus6t.dtb → 安卓正常启动
-#     ⇒ 我们的 DTB 合法，ABL 也接受
-#   * arm64 Image 头逐字段一致（text_offset=0x80000, flags=0xa, magic=ARMd）
-#     唯一差异：image_size = 55.20 MiB（原厂 34.55 / TWRP 37.13 都能启动）
+# 已确立的事实（2026-11-08 实机，全部为单变量对照）：
+#   1) 原厂内核 + 原厂 ramdisk，用 mkbootimg.py 重打包        → 安卓正常启动
+#      ⇒ 打包链 / header v1 / 地址 / os_version / vbmeta 全部没问题
+#   2) 原厂内核 + AGNOS 的 sdm845-oneplus6t.dtb               → 安卓正常启动
+#      ⇒ DTB 合法，ABL 接受
+#   3) 同一颗原厂内核，只改 Image 头里的 image_size：
+#        40 / 50 / 52 MiB → 启动；  53 / 54 / 55 MiB → 6 秒回 fastboot
+#      ⇒ ★ ABL 硬上限 = 52 MiB（0x3400000），与内核内容无关
+#   4) 原始 AGNOS 内核 image_size 55.20 MiB > 52 → 从未被执行（这就是历史失败的根因）
+#   5) fullopt（相机/音频/GPU/WLAN 全留，image_size 50.40 MiB）→ 能被装载，
+#      但设备离线、USB 完全不枚举、屏幕停在 ABL 警告页 ⇒ 内核早期挂住
+#   6) 换成真正的 AGNOS system.img（1.7 GiB）后现象不变 ⇒ 与 rootfs 无关
 #
-# 因此本 workflow 同时产出两个镜像，把「体积」这个唯一剩余变量钉死：
+# 所以现在只剩「内核在哪一步挂住」。本 workflow 用两个单变量变体二分：
+#   nodrm : fullopt - DRM（去掉整个显示子系统）
+#   nocam : fullopt - 相机子系统
+# 判据：AGNOS 用户态起来后，主机会出现 USB NCM 网卡（不需要屏幕、不需要 UART）。
 #
-#   probe   诊断探针：尽量小（去掉相机/音频/GPU/无线/调试），只回答
-#           「一个明显更小的内核能不能被 6T 启动」。★ 测完即废弃，不作交付。
-#
-#   fullopt 全功能优化：camera / audio / GPU 全部保留，只做 -Os
-#           + 去掉纯调试项（KALLSYMS_ALL / DEBUG_KERNEL / SLUB_DEBUG /
-#           *_EVTLOG_DEBUG / MSM_RTB 等），尽量把 image_size 压低。
-#
-# 两者都开 FRAMEBUFFER_CONSOLE + PANIC_TIMEOUT=0，失败时屏幕上能看到 printk。
-#
-# 产物：6T-kernel-<variant>-<ref>，含 Image/Image.gz-dtb/dtb/kernel.config/summary.txt
+# 注：image_size 必须 ≤ 52 MiB，报告步骤会打印该值。
 
 on:
   workflow_dispatch:
@@ -50,7 +49,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [probe, fullopt]
+        variant: [nodrm, nocam]
 
     steps:
       - name: Checkout (this repo, 含 dts/defconfig)
@@ -135,28 +134,8 @@ jobs:
           $SC -d MODULE_SIG -d MODULE_SIG_ALL -d MODULE_SIG_FORCE \
               -d SYSTEM_TRUSTED_KEYS -d SYSTEM_REVOCATION_KEYS || true
 
-          if [ "${{ matrix.variant }}" = "probe" ]; then
-            echo "=== probe：激进瘦身，仅用于判定体积边界（不作交付）==="
-            # ★ 教训 2026-11-08：不要关 CONFIG_WLAN。它会让 WIRELESS_EXT 的结构体成员消失，
-            #   而 drivers/staging/qcacld-3.0 仍以 QCA_CLD_WLAN=y 参与编译，直接编译失败：
-            #     error: 'struct net_device' has no member named 'wireless_handlers'
-            #   要瘦无线，就精确关掉 QCA_CLD_WLAN 本身（它是体积大户）。
-            $SC -d QCA_CLD_WLAN \
-                -d MSMB_CAMERA -d MSM_CAMERA_SENSOR \
-                -d QCOM_KGSL -d QCOM_KGSL_IOMMU \
-                -d SND_SOC -d SOUND \
-                -d NFC_NQ \
-                -d KALLSYMS_ALL -d DEBUG_KERNEL -d SLUB_DEBUG \
-                -d PROFILING -d PSTORE_FTRACE \
-                -d DRM_SDE_EVTLOG_DEBUG -d MSM_SDE_ROTATOR_EVTLOG_DEBUG \
-                -d MSM_GLADIATOR_HANG_DETECT \
-                -d MSM_RTB -d MSM_RTB_SEPARATE \
-                -d CGROUP_DEBUG -d SCSI_DEBUG \
-                -d F2FS_FS -d NTFS_FS -d XFS_FS -d ISO9660_FS -d UDF_FS \
-                -d NFS_FS -d CIFS -d 9P_FS -d HFS_FS -d JFS_FS \
-                -e CC_OPTIMIZE_FOR_SIZE -d CC_OPTIMIZE_FOR_PERFORMANCE || true
-          else
-            echo "=== fullopt：功能全留，只做 -Os + 去调试 ==="
+          if [ "${{ matrix.variant }}" = "fullopt" ]; then
+            echo "=== fullopt：功能全留，只做 -Os + 去调试（已知：能被装载，但早期挂住）==="
             $SC -d KALLSYMS_ALL \
                 -d DEBUG_KERNEL -d SLUB_DEBUG -d PROFILING \
                 -d PSTORE_FTRACE \
@@ -165,6 +144,27 @@ jobs:
                 -d MSM_RTB -d MSM_RTB_SEPARATE \
                 -d CGROUP_DEBUG -d SCSI_DEBUG \
                 -e CC_OPTIMIZE_FOR_SIZE -d CC_OPTIMIZE_FOR_PERFORMANCE || true
+
+          elif [ "${{ matrix.variant }}" = "nodrm" ]; then
+            echo "=== nodrm：在 fullopt 基础上【只去掉显示子系统】==="
+            # 目的：判定「内核挂住」是否发生在 DRM/SDE/DSI 面板初始化。
+            # 去掉显示后屏幕不会有输出，判据改为：AGNOS 用户态起来后
+            # USB NCM 网卡会出现在主机 ifconfig 里。
+            $SC -d KALLSYMS_ALL -d DEBUG_KERNEL -d SLUB_DEBUG -d PROFILING \
+                -d PSTORE_FTRACE -d MSM_RTB -d MSM_RTB_SEPARATE \
+                -d CGROUP_DEBUG -d SCSI_DEBUG || true
+            $SC -d DRM || true
+            $SC -e CC_OPTIMIZE_FOR_SIZE -d CC_OPTIMIZE_FOR_PERFORMANCE || true
+
+          elif [ "${{ matrix.variant }}" = "nocam" ]; then
+            echo "=== nocam：在 fullopt 基础上【只去掉相机 subsystems】==="
+            # 目的：判定是否 camera_v2 在 6T 上 probe 时死等。
+            $SC -d KALLSYMS_ALL -d DEBUG_KERNEL -d SLUB_DEBUG -d PROFILING \
+                -d PSTORE_FTRACE -d MSM_RTB -d MSM_RTB_SEPARATE \
+                -d CGROUP_DEBUG -d SCSI_DEBUG || true
+            $SC -d MSMB_CAMERA -d MSM_CAMERA_SENSOR -d MSM_ISPIF \
+                -d MSM_ISPIF_V2 -d MSMB_JPEG || true
+            $SC -e CC_OPTIMIZE_FOR_SIZE -d CC_OPTIMIZE_FOR_PERFORMANCE || true
           fi
 
           make O=out-${{ matrix.variant }} olddefconfig
