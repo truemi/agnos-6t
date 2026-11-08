@@ -1,0 +1,222 @@
+name: build-kernel-min
+
+# OnePlus 6T (fajita / SDM845) AGNOS 内核 —— 最小化重编，目标 Image < 34 MiB
+#
+# 背景：build-kernel.yml 产出的内核解压 43.52 MiB（image_size 55.19 MiB），
+#   6T 原厂 ABL 装不下（原厂内核 29.17 MiB / image_size 34.55 MiB），实机
+#   会离线 3~4.5 s 回 fastboot、slot-retry-count 恒 7（内核一行没执行）。
+#   TWRP（内核 ~15 MiB）能刷入并启动，反向印证「内核太大」是唯一卡点。
+#
+# 本流程在能编出来的 fajita_defconfig 上做瘦身：
+#   关相机(MSMB_CAMERA)、音频(SND_SOC + WCD934X/WSA881X)、3D GPU(QCOM_KGSL)、
+#   NFC，并 -O2 → -Os、去掉 KALLSYMS_ALL。
+#   保留：UFS、USB DWC3 + gadget(NCM/ACM)、DRM/面板(s6e3fc2x01)、串口 geni、ext4。
+#
+# 产物只有内核 Image.gz-dtb + 尺寸报告，打包 boot / 刷机在本地脚本包做。
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: 'agnos-kernel-sdm845 分支'
+        required: false
+        default: 'master'
+      jobs:
+        description: 'make -j'
+        required: false
+        default: '4'
+      max_image_mib:
+        description: 'Image 解压尺寸上限(MiB)，超过判 FAIL'
+        required: false
+        default: '34'
+
+permissions:
+  contents: read
+
+env:
+  KERNEL_REPO: 'https://github.com/commaai/agnos-kernel-sdm845.git'
+  DEFCONFIG: 'fajita_defconfig'
+  DT_NAME: 'sdm845-oneplus6t'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout (this repo, 含 dts/defconfig)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            gcc-aarch64-linux-gnu device-tree-compiler \
+            python3 python3-pip cpio rsync xz-utils libssl-dev libelf-dev \
+            gcc libc6-dev make
+          # Linux 4.9 的 scripts/ 硬引用 python2（ubuntu-24.04 已移除），软链到 python3
+          sudo ln -sf /usr/bin/python3 /usr/local/bin/python2
+          aarch64-linux-gnu-gcc --version | head -1
+          dtc --version
+
+      - name: Fetch kernel source (shallow)
+        run: |
+          REF="${{ inputs.kernel_ref || 'master' }}"
+          git clone --depth 1 --single-branch --branch "$REF" "$KERNEL_REPO" kernel
+          cd kernel
+          echo "kernel commit: $(git rev-parse HEAD)"
+
+      - name: Install 6T board support
+        run: |
+          set -euo pipefail
+          cp "dts/${DT_NAME}.dts" kernel/arch/arm64/boot/dts/qcom/
+          DTS_MAKE=kernel/arch/arm64/boot/dts/qcom/Makefile
+          if ! grep -q "${DT_NAME}.dtb" "$DTS_MAKE"; then
+            echo "dtb-\$(CONFIG_ARCH_QCOM) += ${DT_NAME}.dtb" >> "$DTS_MAKE"
+          fi
+          cp "defconfig/${DEFCONFIG}" kernel/arch/arm64/configs/
+          sed -i 's|^CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE_NAMES=.*|CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE_NAMES="qcom/sdm845-oneplus6t"|' \
+            "kernel/arch/arm64/configs/${DEFCONFIG}"
+          grep APPENDED "kernel/arch/arm64/configs/${DEFCONFIG}"
+
+      - name: Patch py2 scripts for py3
+        run: |
+          set -euo pipefail
+          cd kernel
+          python3 - <<'PYEOF'
+          from pathlib import Path
+          wrapper = r"""#!/usr/bin/env python3
+          import os, subprocess, sys
+          if os.environ.get("ALLOW_WERROR_SPAM"):
+              sys.exit(subprocess.call(sys.argv[1:]))
+          proc = subprocess.Popen(sys.argv[1:], stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, universal_newlines=True)
+          out, err = proc.communicate()
+          sys.stdout.write(out); sys.stderr.write(err)
+          sys.exit(proc.returncode)
+          """
+          Path("scripts/gcc-wrapper.py").write_text(wrapper)
+          Path("scripts/gcc-wrapper.py").chmod(0o755)
+          PYEOF
+          python3 -m py_compile scripts/gcc-wrapper.py && echo "gcc-wrapper.py OK"
+
+      - name: Configure (base defconfig)
+        run: |
+          set -euo pipefail
+          cd kernel
+          export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          mkdir -p out
+          make O=out "$DEFCONFIG" 2>&1 | tail -15
+
+      - name: Debloat (shrink kernel < 34 MiB)
+        run: |
+          set -euo pipefail
+          cd kernel
+          export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          SC="scripts/config --file out/.config"
+          # 关掉体积大头（都是内置 =y）：
+          #   相机 camera_v2、音频 ASoC 编解码、3D GPU、NFC、全量符号表
+          $SC -d MSMB_CAMERA \
+              -d MSM_CAMERA_SENSOR \
+              -d SND_SOC \
+              -d SND_SOC_WCD934X \
+              -d SND_SOC_WSA881X \
+              -d QCOM_KGSL \
+              -d NFC_NQ \
+              -d KALLSYMS_ALL \
+              -d CC_OPTIMIZE_FOR_PERFORMANCE \
+              -e CC_OPTIMIZE_FOR_SIZE || true
+          # 不签模块（与官方一致）
+          $SC -d MODULE_SIG -d MODULE_SIG_ALL -d MODULE_SIG_FORCE \
+              -d SYSTEM_TRUSTED_KEYS -d SYSTEM_REVOCATION_KEYS || true
+          make O=out olddefconfig
+          echo "=== 瘦身后关键配置（应全部 not set，除 CC_OPTIMIZE_FOR_SIZE=y）==="
+          grep -E "^CONFIG_MSMB_CAMERA=|^CONFIG_MSM_CAMERA_SENSOR=|^CONFIG_SND_SOC=|^CONFIG_QCOM_KGSL=|^CONFIG_NFC_NQ=|^CONFIG_CC_OPTIMIZE_FOR_SIZE=|^CONFIG_KALLSYMS_ALL=" out/.config || true
+
+      - name: Build dtb first (fail fast)
+        run: |
+          set -euo pipefail
+          cd kernel
+          export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          export KCFLAGS="-w" WERROR=0
+          make O=out -j"${{ inputs.jobs || '4' }}" "qcom/${DT_NAME}.dtb" 2>&1 | tail -20
+          file out/arch/arm64/boot/dts/qcom/${DT_NAME}.dtb
+
+      - name: Build kernel
+        run: |
+          set -euo pipefail
+          cd kernel
+          export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          export KCFLAGS="-w" WERROR=0
+          set -o pipefail
+          make O=out -j"${{ inputs.jobs || '4' }}" Image.gz-dtb > /tmp/kbuild.log 2>&1 || {
+            rc=$?
+            echo "=== BUILD FAILED rc=$rc ==="
+            grep -nE 'error:|\*\*\*|No rule|undefined reference|fatal' /tmp/kbuild.log | tail -30
+            tail -30 /tmp/kbuild.log
+            exit $rc
+          }
+          tail -20 /tmp/kbuild.log
+
+      - name: Report kernel size
+        run: |
+          set -uo pipefail
+          K=kernel/out/arch/arm64/boot
+          MAX=${{ inputs.max_image_mib || '34' }}
+          mkdir -p dist
+          report() {
+            local f="$1"; [ -f "$f" ] || return 0
+            printf '%-12s %10s bytes  (%6.2f MiB)\n' \
+              "$(basename "$f")" "$(stat -c%s "$f")" \
+              "$(echo "scale=4; $(stat -c%s "$f") / 1048576" | bc)"
+          }
+          echo "=== 内核尺寸报告（目标 Image <= ${MAX} MiB，对齐原厂 34.55 MiB）==="
+          report "$K/Image"
+          report "$K/Image.gz"
+          report "$K/Image.gz-dtb"
+          report "$K/vmlinux"
+          N=$(stat -c%s "$K/Image" 2>/dev/null || echo 0)
+          IMG_MIB=$(echo "scale=2; $N / 1048576" | bc)
+          if [ -f "$K/Image" ] && [ "$(echo "$IMG_MIB <= $MAX" | bc)" = 1 ]; then
+            echo "SIZE_PASS: Image=${IMG_MIB} MiB <= ${MAX} MiB"
+          else
+            echo "SIZE_FAIL: Image=${IMG_MIB} MiB > ${MAX} MiB（仍需继续瘦身）"
+          fi
+          echo "$IMG_MIB" > dist/image_mib.txt
+          VERDICT="FAIL"; [ "$(echo "$IMG_MIB <= $MAX" | bc)" = 1 ] && VERDICT="PASS"
+          echo "$VERDICT" > dist/size_verdict.txt
+
+      - name: Collect artifacts
+        if: always()
+        run: |
+          set -uo pipefail
+          K=kernel/out/arch/arm64/boot
+          for f in Image Image.gz Image-dtb Image.gz-dtb; do
+            [ -f "$K/$f" ] && cp "$K/$f" dist/ || true
+          done
+          [ -f "$K/dts/qcom/${DT_NAME}.dtb" ] && cp "$K/dts/qcom/${DT_NAME}.dtb" dist/
+          cp kernel/out/.config dist/kernel.config 2>/dev/null || true
+          ls -lh dist/
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 6T-kernel-min-${{ inputs.kernel_ref || 'master' }}
+          path: dist
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: |
+            kernel/out/.config
+            /tmp/kbuild.log
+          if-no-files-found: ignore
+          retention-days: 7
